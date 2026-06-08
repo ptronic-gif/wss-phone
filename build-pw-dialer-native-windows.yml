@@ -1,0 +1,142 @@
+name: Build pW Dialer Native Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Baresip dependencies via MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-libsrtp
+            git
+
+      - name: Clone libre
+        shell: msys2 {0}
+        run: git clone --depth 1 https://github.com/baresip/re.git
+
+      - name: Build and install libre
+        shell: msys2 {0}
+        run: |
+          cmake -S re -B re/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/ucrt64
+          cmake --build re/build -j4
+          cmake --install re/build
+
+      - name: Clone librem
+        shell: msys2 {0}
+        run: git clone --depth 1 https://github.com/baresip/rem.git
+
+      - name: Build and install librem
+        shell: msys2 {0}
+        run: |
+          cmake -S rem -B rem/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/ucrt64
+          cmake --build rem/build -j4
+          cmake --install rem/build
+
+      - name: Clone baresip
+        shell: msys2 {0}
+        run: git clone --depth 1 https://github.com/baresip/baresip.git
+
+      - name: Build baresip with WSS, ICE and DTLS-SRTP modules
+        shell: msys2 {0}
+        run: |
+          cmake -S baresip -B baresip/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/ucrt64 \
+            -DMODULES="wasapi;opus;g711;auresamp;auconv;stun;turn;ice;srtp;dtls_srtp;account;menu;ctrl_tcp;natpmp" \
+            -DOPENSSL_ROOT_DIR=/ucrt64
+          cmake --build baresip/build -j4
+
+      - name: Collect baresip runtime
+        shell: msys2 {0}
+        run: |
+          rm -rf runtime/baresip
+          mkdir -p runtime/baresip
+
+          cp baresip/build/baresip.exe runtime/baresip/
+
+          # Copy all Baresip-built DLLs/modules.
+          find baresip/build -name "*.dll" -exec cp {} runtime/baresip/ \;
+
+          echo "=== ldd baresip.exe ==="
+          ldd baresip/build/baresip.exe || true
+
+          # Copy all UCRT64 DLL dependencies detected by ldd.
+          ldd baresip/build/baresip.exe \
+            | grep '/ucrt64/' \
+            | awk '{print $3}' \
+            | xargs -I{} cp {} runtime/baresip/ 2>/dev/null || true
+
+          # Copy direct dependencies and common runtime DLLs explicitly.
+          for dll in \
+            libssl-3-x64.dll \
+            libcrypto-3-x64.dll \
+            libopus-0.dll \
+            libsrtp2-1.dll \
+            zlib1.dll \
+            libz-1.dll \
+            libre.dll \
+            librem.dll \
+            libgcc_s_seh-1.dll \
+            libwinpthread-1.dll \
+            libstdc++-6.dll; do
+            cp /ucrt64/bin/$dll runtime/baresip/ 2>/dev/null && echo "Copied $dll" || echo "Not found: $dll"
+          done
+
+          cp re/build/libre.dll runtime/baresip/ 2>/dev/null || true
+          cp rem/build/librem.dll runtime/baresip/ 2>/dev/null || true
+
+          echo "=== Final baresip runtime contents ==="
+          ls -lh runtime/baresip/
+
+      - name: Publish pW Dialer Native app
+        shell: pwsh
+        run: |
+          dotnet restore .\pW-Dialer-Native.csproj
+          dotnet publish .\pW-Dialer-Native.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:EnableCompressionInSingleFile=true
+          if (Test-Path .\publish) { Remove-Item .\publish -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path .\publish | Out-Null
+          Copy-Item .\bin\Release\net8.0-windows\win-x64\publish\pW-Dialer-Native.exe .\publish\
+          Copy-Item .\runtime .\publish\ -Recurse -Force
+          Copy-Item .\README.md .\publish\
+
+      - name: Upload complete runtime package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pW-Dialer-Native-Windows-complete
+          path: publish/
+          retention-days: 30
+
+      - name: Upload baresip runtime only
+        uses: actions/upload-artifact@v4
+        with:
+          name: baresip-windows-runtime-webrtc
+          path: runtime/baresip/
+          retention-days: 30
